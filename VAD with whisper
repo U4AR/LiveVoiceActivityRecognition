@@ -1,0 +1,104 @@
+import torch
+import pyaudio
+import numpy as np
+import whisper
+import wave
+from collections import deque
+
+# Set the number of threads for Torch
+torch.set_num_threads(1)
+
+# Load Silero VAD model and Whisper model
+vad_model, vad_utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', source='github')
+(get_speech_timestamps, _, _, _, _) = vad_utils  # Extract necessary VAD utilities
+whisper_model = whisper.load_model("base")  # Load Whisper model (you can change "base" to other sizes like "tiny" or "large")
+
+# Constants for audio input
+RATE = 16000  # Sampling rate
+CHUNK_DURATION_SEC = 0.5  # Chunk duration of 0.5 seconds (500 ms)
+CHUNK_SIZE = int(RATE * CHUNK_DURATION_SEC)  # Size of each chunk (in samples)
+
+# Initialize PyAudio for microphone input
+p = pyaudio.PyAudio()
+
+# Open the microphone stream
+stream = p.open(format=pyaudio.paInt16,
+                channels=1,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE)
+
+print("Listening for voice activity...")
+
+# Buffers and state variables
+buffer = deque(maxlen=2)  # Buffer to store the current and previous chunk
+speech_buffer = []  # Buffer to store speech segments
+silence_count = 0  # Counter for consecutive silent chunks
+
+def normalize_audio(audio):
+    """ Normalize audio to [-1, 1] range for the Silero model """
+    return audio / np.max(np.abs(audio))
+
+def save_audio_to_wav(audio_data, filepath, rate=16000):
+    """ Save audio data to a WAV file """
+    with wave.open(filepath, 'wb') as wf:
+        wf.setnchannels(1)  # Mono audio
+        wf.setsampwidth(2)  # 2 bytes per sample (16-bit PCM)
+        wf.setframerate(rate)  # Set the sample rate
+        wf.writeframes(audio_data)  # Write audio data to the file
+
+try:
+    while True:
+        # Read a chunk of audio from the microphone
+        audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+
+        # Convert the audio to numpy array and normalize
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+        audio_np = normalize_audio(audio_np)
+
+        # Add the current chunk to buffer (for the last + current chunk approach)
+        buffer.append(audio_np)
+
+        # Convert to tensor and process with VAD
+        audio_tensor = torch.from_numpy(audio_np).unsqueeze(0)
+        speech_timestamps = get_speech_timestamps(audio_tensor, vad_model, sampling_rate=RATE, return_seconds=True)
+
+        if len(speech_timestamps) > 0:  # Speech detected
+            print("Speech detected!")
+            silence_count = 0  # Reset silence count
+            speech_buffer.extend(buffer)  # Add both current and previous chunk (buffer)
+        else:
+            print("Silence...")
+            silence_count += 1  # Increment silence counter
+
+        # If 4 consecutive silences are detected, process the speech buffer
+        if silence_count >= 4 and len(speech_buffer) > 0:
+            # Concatenate buffered audio for Whisper processing
+            speech_audio = np.concatenate(speech_buffer, axis=0)
+            
+            # Convert the float32 audio back to 16-bit PCM
+            speech_audio_int16 = (speech_audio * 32767).astype(np.int16)
+
+            # Convert the speech audio to bytes
+            speech_audio_bytes = speech_audio_int16.tobytes()
+
+            # Save the audio for whisper transcription
+            audio_filepath = "temp_speech.wav"
+            save_audio_to_wav(speech_audio_bytes, audio_filepath, rate=RATE)
+
+            # Transcribe the audio using Whisper
+            print("Processing transcription...")
+            result = whisper_model.transcribe(audio_filepath)
+
+            # Print the transcription
+            print("Transcription:", result['text'])
+
+            # Clear speech buffer after processing
+            speech_buffer.clear()
+
+except KeyboardInterrupt:
+    # Cleanup when done
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    print("Stopped recording.")
