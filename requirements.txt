@@ -1,4 +1,4 @@
-torch-2.4.1+cpu
-torchaudio-2.4.1+cpu
+torch
+torchaudio
 pyaudio-0.2.14
 openai-whisper
